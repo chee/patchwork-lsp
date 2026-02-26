@@ -35,10 +35,6 @@ importers:
         version: 1.6.1(@types/node@20.19.34)
 
   vscode-extension:
-    dependencies:
-      vscode-languageclient:
-        specifier: ^9.0.1
-        version: 9.0.1
     devDependencies:
       '@types/vscode':
         specifier: ^1.85.0
@@ -46,9 +42,15 @@ importers:
       '@vscode/vsce':
         specifier: ^3.7.1
         version: 3.7.1
+      esbuild:
+        specifier: ^0.24.0
+        version: 0.24.2
       typescript:
         specifier: ^5.4.0
         version: 5.9.3
+      vscode-languageclient:
+        specifier: ^9.0.1
+        version: 9.0.1
 
 packages:
 

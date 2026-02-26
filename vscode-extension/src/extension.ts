@@ -227,13 +227,11 @@ async function startClient(
     fileCount: 0,
   });
 
-  // The server is the compiled server.cjs from the parent package
-  const serverModule = context.asAbsolutePath(path.join("..", "dist", "server.cjs"));
-
-  // If running in dev, the server might be at a different location
-  const serverPath = fs.existsSync(serverModule)
-    ? serverModule
-    : path.resolve(__dirname, "..", "..", "dist", "server.cjs");
+  // Look for server.cjs: first next to the bundled extension (published),
+  // then in the parent package's dist (development)
+  const bundledServer = path.join(__dirname, "server.cjs");
+  const devServer = path.resolve(__dirname, "..", "..", "dist", "server.cjs");
+  const serverPath = fs.existsSync(bundledServer) ? bundledServer : devServer;
 
   const serverOptions: ServerOptions = {
     command: "node",
