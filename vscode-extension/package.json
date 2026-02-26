@@ -2,7 +2,7 @@
   "name": "patchworkfs",
   "displayName": "patchworkfs",
   "description": "Edit automerge patchwork-filesystem folders in VS Code",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "license": "AGPL-3.0-or-later",
   "publisher": "chee",
   "repository": {

@@ -1,6 +1,7 @@
 import * as esbuild from "esbuild";
 import * as fs from "fs";
 import * as path from "path";
+import { execSync } from "child_process";
 
 const watch = process.argv.includes("--watch");
 
@@ -38,3 +39,29 @@ if (fs.existsSync(serverSrc)) {
   console.warn("Warning: server.cjs not found at", serverSrc);
   console.warn("Run 'pnpm build' in the root first.");
 }
+
+// Install server dependencies into dist/node_modules so they ship with the vsix.
+// server.cjs has @automerge/vanillajs as an external require (WASM can't be bundled).
+const distPkg = path.resolve("dist", "package.json");
+fs.writeFileSync(
+  distPkg,
+  JSON.stringify({
+    private: true,
+    dependencies: {
+      "@automerge/vanillajs": "latest",
+    },
+  })
+);
+
+console.log("Installing server dependencies into dist/node_modules...");
+execSync("npm install --omit=dev --ignore-scripts", {
+  cwd: path.resolve("dist"),
+  stdio: "inherit",
+});
+
+// Clean up the temporary package.json and lockfile
+fs.unlinkSync(distPkg);
+const distLock = path.resolve("dist", "package-lock.json");
+if (fs.existsSync(distLock)) fs.unlinkSync(distLock);
+
+console.log("Server dependencies installed.");

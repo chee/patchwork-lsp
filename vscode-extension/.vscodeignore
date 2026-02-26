@@ -1,7 +1,8 @@
 src/**
-node_modules/**
+/node_modules/**
 tsconfig.json
 build.mjs
 .gitignore
 **/*.ts
+!dist/node_modules/**/*.wasm
 **/*.map
