@@ -4,6 +4,7 @@
   "description": "Edit automerge patchwork-filesystem folders in VS Code",
   "version": "0.1.0",
   "license": "AGPL-3.0-or-later",
+  "publisher": "chee",
   "engines": {
     "vscode": "^1.85.0"
   },
