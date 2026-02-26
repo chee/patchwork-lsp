@@ -7,14 +7,17 @@ import {
   LanguageClientOptions,
   ServerOptions,
 } from "vscode-languageclient/node";
+import { AutomergeFsProvider } from "./automerge-fs-provider.js";
 
 let client: LanguageClient | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
+let fsProvider: AutomergeFsProvider | undefined;
 let currentContext: vscode.ExtensionContext | undefined;
 let currentWorkspaceRoot: string | undefined;
 let currentFolderUrl: string | undefined;
 let currentSyncServerUrl: string | undefined;
 let currentDebug: boolean | undefined;
+let currentMode: "vfs" | "fallback" | undefined;
 
 const DEFAULT_SYNC_SERVER = "wss://sync3.automerge.org";
 
@@ -29,6 +32,15 @@ interface AutomergeStatus {
 
 export function activate(context: vscode.ExtensionContext) {
   currentContext = context;
+
+  // Register FileSystemProvider for the automerge: scheme
+  fsProvider = new AutomergeFsProvider(() => client);
+  context.subscriptions.push(
+    vscode.workspace.registerFileSystemProvider("automerge", fsProvider, {
+      isCaseSensitive: true,
+      isReadonly: false,
+    })
+  );
 
   // Create status bar item
   statusBarItem = vscode.window.createStatusBarItem(
@@ -58,14 +70,15 @@ export function activate(context: vscode.ExtensionContext) {
   const restartCmd = vscode.commands.registerCommand(
     "automerge.restart",
     async () => {
-      if (currentContext && currentWorkspaceRoot && currentFolderUrl && currentSyncServerUrl) {
+      if (currentContext && currentFolderUrl && currentSyncServerUrl) {
         vscode.window.showInformationMessage("PatchworkFS: Restarting...");
         await startClient(
           currentContext,
-          currentWorkspaceRoot,
           currentFolderUrl,
           currentSyncServerUrl,
-          currentDebug
+          currentDebug,
+          currentMode ?? "fallback",
+          currentWorkspaceRoot
         );
         vscode.window.showInformationMessage("PatchworkFS: Restarted.");
       } else {
@@ -97,39 +110,57 @@ export function activate(context: vscode.ExtensionContext) {
 
       if (syncServerUrl === undefined) return;
 
-      // Create a workspace directory for this folder
-      const workspaceDir = path.join(
-        os.tmpdir(),
-        "automerge-lsp",
-        folderUrl.replace(/[^a-zA-Z0-9]/g, "_").slice(0, 40)
-      );
-      fs.mkdirSync(workspaceDir, { recursive: true });
+      // Store folder URL and sync server in globalState for persistence
+      context.globalState.update("automerge.folderUrl", folderUrl);
+      context.globalState.update("automerge.syncServerUrl", syncServerUrl || DEFAULT_SYNC_SERVER);
 
-      // Write settings so the extension auto-starts after folder opens
-      const vscodeDir = path.join(workspaceDir, ".vscode");
-      fs.mkdirSync(vscodeDir, { recursive: true });
-      fs.writeFileSync(
-        path.join(vscodeDir, "settings.json"),
-        JSON.stringify(
-          {
-            "automerge.folderUrl": folderUrl,
-            "automerge.syncServerUrl": syncServerUrl || DEFAULT_SYNC_SERVER,
-          },
-          null,
-          2
-        )
-      );
+      // Extract the doc ID from the folder URL (strip automerge: prefix if present)
+      const rootDocId = folderUrl.startsWith("automerge:")
+        ? folderUrl.slice("automerge:".length)
+        : folderUrl;
 
-      // Open the workspace folder — this reloads the window,
-      // so the extension will re-activate and pick up the settings
-      const uri = vscode.Uri.file(workspaceDir);
-      await vscode.commands.executeCommand("vscode.openFolder", uri);
+      // Open as virtual workspace.
+      // Use path-based format: automerge:/<docId>/ — NOT authority-based,
+      // because VS Code lowercases the authority component per RFC 3986,
+      // which mangles case-sensitive Automerge doc IDs.
+      const wsUri = vscode.Uri.from({ scheme: "automerge", path: `/${rootDocId}/` });
+      vscode.workspace.updateWorkspaceFolders(0, 0, {
+        uri: wsUri,
+        name: `PatchworkFS: ${rootDocId.slice(0, 8)}...`,
+      });
+
+      // Start the LSP client in VFS mode
+      await startClient(
+        context,
+        folderUrl,
+        syncServerUrl || DEFAULT_SYNC_SERVER,
+        undefined,
+        "vfs"
+      );
     }
   );
 
   context.subscriptions.push(openFolderCmd);
 
-  // Auto-start if we detect automerge config in workspace settings
+  // Check for automerge: scheme workspace folders (VFS mode auto-start)
+  const automergeFolder = vscode.workspace.workspaceFolders?.find(
+    (f) => f.uri.scheme === "automerge"
+  );
+
+  if (automergeFolder) {
+    // Recover folderUrl from globalState, or reconstruct from URI path
+    // URI format: automerge:/<docId>/  →  path = /<docId>/
+    const storedFolderUrl = context.globalState.get<string>("automerge.folderUrl");
+    const folderUrl = storedFolderUrl || `automerge:${extractDocId(automergeFolder.uri)}`;
+    const syncServerUrl =
+      (context.globalState.get<string>("automerge.syncServerUrl")) ||
+      DEFAULT_SYNC_SERVER;
+
+    startClient(context, folderUrl, syncServerUrl, undefined, "vfs");
+    return;
+  }
+
+  // Fallback: auto-start if we detect automerge config in workspace settings (disk mode)
   const config = vscode.workspace.getConfiguration("automerge");
   const folderUrl = config.get<string>("folderUrl");
 
@@ -137,7 +168,7 @@ export function activate(context: vscode.ExtensionContext) {
     const syncServerUrl = config.get<string>("syncServerUrl") || DEFAULT_SYNC_SERVER;
     const debug = config.get<boolean>("debug");
     const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
-    startClient(context, workspaceRoot, folderUrl, syncServerUrl, debug);
+    startClient(context, folderUrl, syncServerUrl, debug, "fallback", workspaceRoot);
   }
 }
 
@@ -204,16 +235,18 @@ function updateStatusBar(status: AutomergeStatus): void {
 
 async function startClient(
   context: vscode.ExtensionContext,
-  workspaceRoot: string,
   folderUrl: string,
   syncServerUrl: string,
-  debug?: boolean
+  debug?: boolean,
+  mode: "vfs" | "fallback" = "fallback",
+  workspaceRoot?: string
 ): Promise<void> {
   // Store for restart
-  currentWorkspaceRoot = workspaceRoot;
   currentFolderUrl = folderUrl;
   currentSyncServerUrl = syncServerUrl;
   currentDebug = debug;
+  currentMode = mode;
+  currentWorkspaceRoot = workspaceRoot;
 
   if (client) {
     await client.stop();
@@ -238,18 +271,36 @@ async function startClient(
     args: [serverPath, "--stdio"],
   };
 
+  // Build document selector based on mode
+  const documentSelector: LanguageClientOptions["documentSelector"] = [];
+  if (mode === "vfs") {
+    documentSelector.push({ scheme: "automerge" });
+  }
+  if (workspaceRoot) {
+    documentSelector.push({ scheme: "file", pattern: `${workspaceRoot}/**` });
+  }
+  // Always include both schemes so the server can handle either
+  if (!documentSelector.some((s) => "scheme" in s && s.scheme === "automerge")) {
+    documentSelector.push({ scheme: "automerge" });
+  }
+
   const clientOptions: LanguageClientOptions = {
-    documentSelector: [{ scheme: "file", pattern: `${workspaceRoot}/**` }],
+    documentSelector,
     initializationOptions: {
       folderUrl,
       syncServerUrl,
       debug,
+      mode,
     },
-    workspaceFolder: {
-      uri: vscode.Uri.file(workspaceRoot),
-      name: path.basename(workspaceRoot),
-      index: 0,
-    },
+    ...(workspaceRoot
+      ? {
+          workspaceFolder: {
+            uri: vscode.Uri.file(workspaceRoot),
+            name: path.basename(workspaceRoot),
+            index: 0,
+          },
+        }
+      : {}),
   };
 
   client = new LanguageClient(
@@ -266,6 +317,52 @@ async function startClient(
   client.onNotification("automerge/status", (status: AutomergeStatus) => {
     updateStatusBar(status);
   });
+
+  // Listen for file change notifications from the server → forward to FileSystemProvider
+  client.onNotification(
+    "automerge/fileChanged",
+    (params: { type: "changed" | "created" | "deleted"; path: string }) => {
+      if (!fsProvider) return;
+
+      // Find automerge: workspace folder to construct URI
+      const automergeFolder = vscode.workspace.workspaceFolders?.find(
+        (f) => f.uri.scheme === "automerge"
+      );
+      if (!automergeFolder) return;
+
+      const rootDocId = extractDocId(automergeFolder.uri);
+      const uri = vscode.Uri.from({
+        scheme: "automerge",
+        path: `/${rootDocId}/${params.path}`,
+      });
+
+      let changeType: vscode.FileChangeType;
+      switch (params.type) {
+        case "created":
+          changeType = vscode.FileChangeType.Created;
+          break;
+        case "deleted":
+          changeType = vscode.FileChangeType.Deleted;
+          break;
+        default:
+          changeType = vscode.FileChangeType.Changed;
+          break;
+      }
+
+      fsProvider.fireChange([{ type: changeType, uri }]);
+    }
+  );
+}
+
+/**
+ * Extract the Automerge doc ID from a workspace URI.
+ * Path-based: automerge:/<docId>/  →  first path segment
+ * Authority-based (legacy): automerge://<docId>/  →  authority
+ */
+function extractDocId(uri: vscode.Uri): string {
+  if (uri.authority) return uri.authority;
+  const segments = uri.path.split("/").filter(Boolean);
+  return segments[0] || "";
 }
 
 export async function deactivate(): Promise<void> {

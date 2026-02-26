@@ -7,7 +7,7 @@ import {
   DidCloseTextDocumentParams,
 } from "vscode-languageserver";
 import { splice as amSplice } from "@automerge/vanillajs";
-import type { FileMapper } from "./file-mapper.js";
+import type { DocumentResolver } from "./document-resolver.js";
 import type { AutomergeBridge } from "./automerge-bridge.js";
 import type { DebugLogger } from "./debug-logger.js";
 import { lspChangeToSplice, applySplice } from "./edit-converter.js";
@@ -17,6 +17,7 @@ export interface InitOptions {
   folderUrl: string;
   syncServerUrl: string;
   debug?: boolean;
+  mode?: "vfs" | "fallback";
 }
 
 /**
@@ -43,15 +44,16 @@ export class PendingDocuments {
 
 /**
  * Sets up all LSP handlers on the given connection.
- * Uses getter functions for fileMapper and bridge since they may be
+ * Uses getter functions for resolver and bridge since they may be
  * initialized asynchronously after the server starts.
  */
 export function setupHandlers(
   connection: Connection,
-  getFileMapper: () => FileMapper | undefined,
+  getResolver: () => DocumentResolver | undefined,
   getBridge: () => AutomergeBridge | undefined,
   getDebug: () => DebugLogger | undefined,
-  pendingDocs: PendingDocuments
+  pendingDocs: PendingDocuments,
+  getWorkspaceRoot: () => string | undefined
 ): void {
   connection.onInitialized(() => {
     connection.console.info("Automerge LSP server initialized");
@@ -61,28 +63,24 @@ export function setupHandlers(
     const uri = params.textDocument.uri;
     const text = params.textDocument.text;
     const bridge = getBridge();
-    const fileMapper = getFileMapper();
+    const resolver = getResolver();
 
     if (!bridge) {
-      // Bridge not ready yet — stash for later
       pendingDocs.add(uri, text);
       return;
     }
 
-    registerDocument(connection, bridge, fileMapper, uri, text);
+    registerDocument(connection, bridge, resolver, uri, text, getWorkspaceRoot());
   });
 
   connection.onDidChangeTextDocument((params: DidChangeTextDocumentParams) => {
     const uri = params.textDocument.uri;
     const bridge = getBridge();
-    const fileMapper = getFileMapper();
+    const resolver = getResolver();
     const debug = getDebug();
 
     if (!bridge) return;
 
-    // If we're currently applying a remote edit to the editor,
-    // the didChange is just the echo — skip it entirely.
-    // The mirror was already updated in handleRemotePatches.
     if (bridge.isApplyingRemoteEdit()) {
       debug?.guardConsumed(uri, 0, 0, "(remote echo suppressed)");
       return;
@@ -91,37 +89,33 @@ export function setupHandlers(
     let currentText = bridge.getDocumentText(uri);
     if (currentText === undefined) return;
 
-    const mapping = fileMapper?.getByUri(uri);
-    if (!mapping) return;
+    const resolved = resolver?.getByUri(uri, getWorkspaceRoot());
+    if (!resolved) return;
 
     for (const change of params.contentChanges) {
       if (!("range" in change) || !change.range) {
-        // Full document sync — replace everything
         debug?.lspChange(uri, 0, currentText.length, change.text);
         currentText = change.text;
         bridge.setDocumentText(uri, currentText);
 
         debug?.automergeChange(uri, 0, currentText.length, change.text);
-        bridge.applyLocalChange(mapping.docHandle, (doc: UnixFileEntry) => {
+        bridge.applyLocalChange(resolved.docHandle, (doc: UnixFileEntry) => {
           amSplice(doc, ["content"], 0, (doc.content as string).length, change.text);
         });
         continue;
       }
 
-      // Incremental change
       const spliceOp = lspChangeToSplice(currentText, change.range, change.text);
 
       debug?.lspChange(uri, spliceOp.offset, spliceOp.deleteCount, spliceOp.insertText);
 
-      // Apply to automerge (wrapped to suppress local change echo)
       debug?.automergeChange(uri, spliceOp.offset, spliceOp.deleteCount, spliceOp.insertText);
-      bridge.applyLocalChange(mapping.docHandle, (doc: UnixFileEntry) => {
+      bridge.applyLocalChange(resolved.docHandle, (doc: UnixFileEntry) => {
         if (spliceOp.deleteCount > 0 || spliceOp.insertText.length > 0) {
           amSplice(doc, ["content"], spliceOp.offset, spliceOp.deleteCount, spliceOp.insertText);
         }
       });
 
-      // Update our mirror text
       currentText = applySplice(
         currentText,
         spliceOp.offset,
@@ -131,8 +125,7 @@ export function setupHandlers(
       bridge.setDocumentText(uri, currentText);
     }
 
-    // Debounced update of lastSyncAt on all parent folders
-    bridge.touchParentFolders(mapping.automergeUrl);
+    bridge.touchParentFolders(resolved.automergeUrl);
   });
 
   connection.onDidCloseTextDocument((params: DidCloseTextDocumentParams) => {
@@ -144,6 +137,43 @@ export function setupHandlers(
   connection.onDidSaveTextDocument(() => {
     // No-op — automerge is already up to date from didChange
   });
+
+  // --- Custom VFS requests ---
+
+  connection.onRequest("automerge/listFiles", (params: { path?: string }) => {
+    const resolver = getResolver();
+    if (!resolver) return { entries: [] };
+    const vpath = params.path ?? "";
+    return { entries: resolver.listDirectory(vpath) };
+  });
+
+  connection.onRequest("automerge/readFile", (params: { path: string }) => {
+    const resolver = getResolver();
+    if (!resolver) return { content: null };
+    const content = resolver.readFileContent(params.path);
+    return { content: content ?? null };
+  });
+
+  connection.onRequest("automerge/stat", (params: { path: string }) => {
+    const resolver = getResolver();
+    if (!resolver) return null;
+    return resolver.stat(params.path);
+  });
+
+  connection.onRequest("automerge/writeFile", (params: { path: string; content: string }) => {
+    const resolver = getResolver();
+    const bridge = getBridge();
+    if (!resolver || !bridge) return { success: false };
+
+    const resolved = resolver.getByVirtualPath(params.path);
+    if (!resolved) return { success: false };
+
+    bridge.applyLocalChange(resolved.docHandle, (doc: UnixFileEntry) => {
+      amSplice(doc, ["content"], 0, (doc.content as string).length, params.content);
+    });
+
+    return { success: true };
+  });
 }
 
 /**
@@ -152,17 +182,18 @@ export function setupHandlers(
 export function registerDocument(
   connection: Connection,
   bridge: AutomergeBridge,
-  fileMapper: FileMapper | undefined,
+  resolver: DocumentResolver | undefined,
   uri: string,
-  text: string
+  text: string,
+  workspaceRoot?: string
 ): void {
   bridge.setDocumentText(uri, text);
 
-  if (fileMapper) {
-    const mapping = fileMapper.getByUri(uri);
-    if (mapping) {
-      bridge.watchDocument(uri, mapping.docHandle);
-      connection.console.info(`Tracking: ${mapping.name}`);
+  if (resolver) {
+    const resolved = resolver.getByUri(uri, workspaceRoot);
+    if (resolved) {
+      bridge.watchDocument(uri, resolved.docHandle);
+      connection.console.info(`Tracking: ${resolved.name}`);
     }
   }
 }

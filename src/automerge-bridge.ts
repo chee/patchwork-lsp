@@ -2,10 +2,10 @@ import { Repo, WebSocketClientAdapter } from "@automerge/vanillajs";
 import type { DocHandle, AutomergeUrl } from "@automerge/vanillajs";
 import type { Connection } from "vscode-languageserver";
 import { TextEdit } from "vscode-languageserver-protocol";
-import type { FileMapper } from "./file-mapper.js";
+import type { DocumentResolver } from "./document-resolver.js";
 import type { StatusNotifier } from "./status-notifier.js";
 import type { DebugLogger } from "./debug-logger.js";
-import type { FolderDoc, UnixFileEntry, DocLink } from "./types.js";
+import type { FolderDoc, UnixFileEntry, DocLink, ResolvedDocument } from "./types.js";
 import {
   patchToTextEdit,
   positionToOffset,
@@ -16,26 +16,44 @@ import {
 const LAST_SYNC_DEBOUNCE_MS = 500;
 
 /**
+ * Callback for structural file tree changes (file added/removed).
+ */
+export type FileTreeChangeCallback = (
+  type: "created" | "deleted",
+  virtualPath: string,
+  resolved?: ResolvedDocument
+) => void;
+
+/**
+ * Optional disk materializer interface — FileMapper implements this.
+ * When present, the bridge delegates disk operations to it.
+ */
+export interface DiskMaterializer {
+  addMapping(docLink: DocLink): Promise<{ localPath: string } | null>;
+  removeMapping(localPath: string, deleteFile: boolean): void;
+  getByUrl(url: AutomergeUrl): { localPath: string } | undefined;
+  pathToUri(localPath: string): string;
+}
+
+/**
  * AutomergeBridge manages the automerge-repo connection and watches
  * for remote patches on all tracked documents.
  */
 export class AutomergeBridge {
   private repo: Repo;
-  private fileMapper: FileMapper;
+  private resolver: DocumentResolver;
+  private diskMaterializer?: DiskMaterializer;
   private connection: Connection;
   private statusNotifier: StatusNotifier;
   private getDebug: () => DebugLogger | undefined;
   private documentTexts: Map<string, string> = new Map(); // uri -> current text
   private changeListeners: Map<string, () => void> = new Map();
+  private onFileTreeChange?: FileTreeChangeCallback;
 
   // Flag to suppress change events during our own docHandle.change() calls.
-  // This works because docHandle.change() is synchronous and emits the
-  // "change" event synchronously within the call (JS is single-threaded).
   private localChangeInProgress = false;
 
   // Flag to suppress didChange events during our own workspace/applyEdit calls.
-  // The editor sends didChange notifications DURING the applyEdit await
-  // (before the response), so this flag is visible to the didChange handler.
   private _applyingRemoteEdit = false;
 
   // Debounce timer for lastSyncAt updates, keyed by folder handle identity
@@ -43,16 +61,22 @@ export class AutomergeBridge {
 
   constructor(
     repo: Repo,
-    fileMapper: FileMapper,
+    resolver: DocumentResolver,
     connection: Connection,
     statusNotifier: StatusNotifier,
-    getDebug: () => DebugLogger | undefined
+    getDebug: () => DebugLogger | undefined,
+    options?: {
+      diskMaterializer?: DiskMaterializer;
+      onFileTreeChange?: FileTreeChangeCallback;
+    }
   ) {
     this.repo = repo;
-    this.fileMapper = fileMapper;
+    this.resolver = resolver;
     this.connection = connection;
     this.statusNotifier = statusNotifier;
     this.getDebug = getDebug;
+    this.diskMaterializer = options?.diskMaterializer;
+    this.onFileTreeChange = options?.onFileTreeChange;
   }
 
   /**
@@ -106,11 +130,10 @@ export class AutomergeBridge {
    * Debounced — rapid edits coalesce into a single lastSyncAt update per folder.
    */
   touchParentFolders(fileUrl: AutomergeUrl): void {
-    const parents = this.fileMapper.getParentFolders(fileUrl);
+    const parents = this.resolver.getParentFolders(fileUrl);
     const now = Date.now();
 
     for (const folderHandle of parents) {
-      // Debounce per folder handle
       const existing = this.lastSyncTimers.get(folderHandle);
       if (existing) clearTimeout(existing);
 
@@ -136,7 +159,6 @@ export class AutomergeBridge {
    */
   watchDocument(uri: string, handle: DocHandle<UnixFileEntry>): void {
     const onChange = ({ doc, patches }: { doc: UnixFileEntry; patches: any[] }) => {
-      // Skip change events triggered by our own applyLocalChange calls
       if (this.localChangeInProgress) return;
       this.handleRemotePatches(uri, doc, patches as AutomergePatch[]);
     };
@@ -165,7 +187,7 @@ export class AutomergeBridge {
   private async handleRemotePatches(uri: string, doc: UnixFileEntry, patches: AutomergePatch[]): Promise<void> {
     const debug = this.getDebug();
     const currentText = this.documentTexts.get(uri);
-    if (currentText === undefined) return; // Document not open in editor
+    if (currentText === undefined) return;
 
     const contentPatches = patches.filter((p) => p.path[0] === "content");
 
@@ -173,9 +195,9 @@ export class AutomergeBridge {
 
     if (contentPatches.length === 0) return;
 
-    // If there's a "put" on "content", automerge is replacing the entire field.
-    // The subsequent splices are the new content, not incremental edits.
-    // Use the doc's actual content for a full replacement.
+    // Send file changed notification for content changes
+    this.onFileTreeChange?.("changed" as any, uri);
+
     const hasPut = contentPatches.some((p) => p.action === "put" && p.path.length === 1);
     if (hasPut) {
       const newContent = typeof doc.content === "string" ? doc.content : "";
@@ -184,7 +206,7 @@ export class AutomergeBridge {
         newLen: newContent.length,
       });
 
-      if (newContent === currentText) return; // No actual change
+      if (newContent === currentText) return;
 
       const lastLine = currentText.split("\n");
       const endPos = {
@@ -216,7 +238,7 @@ export class AutomergeBridge {
       return;
     }
 
-    // Incremental patches — process one at a time, updating mirror as we go
+    // Incremental patches
     let text = currentText;
     const edits: TextEdit[] = [];
 
@@ -241,7 +263,6 @@ export class AutomergeBridge {
 
       edits.push(edit);
 
-      // Update mirror text
       const offset = positionToOffset(text, edit.range.start);
       const endOffset = positionToOffset(text, edit.range.end);
       text = applySplice(text, offset, endOffset - offset, edit.newText);
@@ -249,15 +270,11 @@ export class AutomergeBridge {
 
     if (edits.length === 0) return;
 
-    // Notify status that we're syncing
     this.statusNotifier.syncing();
-
-    // Update our mirror
     this.documentTexts.set(uri, text);
 
     debug?.editorApplyEdit(uri, edits.length);
 
-    // Push to editor — set flag so didChange handler knows to skip
     this._applyingRemoteEdit = true;
     try {
       await this.connection.workspace.applyEdit({
@@ -283,7 +300,6 @@ export class AutomergeBridge {
     let previousDocs: DocLink[] = initialDoc ? [...initialDoc.docs] : [];
 
     folderHandle.on("change", ({ doc }) => {
-      // Skip folder changes triggered by our own local mutations
       if (this.localChangeInProgress) return;
       const currentDocs = doc.docs;
       this.handleFolderChanges(previousDocs, currentDocs);
@@ -304,9 +320,18 @@ export class AutomergeBridge {
     // Files added
     for (const docLink of current) {
       if (!prevUrls.has(docLink.url)) {
-        const mapping = await this.fileMapper.addMapping(docLink);
-        if (mapping) {
+        // Add to resolver
+        const rootFolderHandle = this.resolver.getRootFolderHandle();
+        const resolved = await this.resolver.addEntry(docLink, "", [rootFolderHandle]);
+
+        // Also materialize to disk if we have a disk materializer
+        if (this.diskMaterializer) {
+          await this.diskMaterializer.addMapping(docLink);
+        }
+
+        if (resolved) {
           this.connection.console.info(`Remote file added: ${docLink.name}`);
+          this.onFileTreeChange?.("created", resolved.virtualPath, resolved);
         }
       }
     }
@@ -314,11 +339,22 @@ export class AutomergeBridge {
     // Files removed
     for (const docLink of previous) {
       if (!currUrls.has(docLink.url)) {
-        const mapping = this.fileMapper.getByUrl(docLink.url);
-        if (mapping) {
-          this.unwatchDocument(this.fileMapper.pathToUri(mapping.localPath));
-          this.fileMapper.removeMapping(mapping.localPath, true);
+        const resolved = this.resolver.getByUrl(docLink.url);
+        if (resolved) {
+          // Unwatch if open in editor
+          // In fallback mode, construct a file:// URI
+          if (this.diskMaterializer) {
+            const diskMapping = this.diskMaterializer.getByUrl(docLink.url);
+            if (diskMapping) {
+              this.unwatchDocument(this.diskMaterializer.pathToUri(diskMapping.localPath));
+              this.diskMaterializer.removeMapping(diskMapping.localPath, true);
+            }
+          }
+
+          const vpath = resolved.virtualPath;
+          this.resolver.removeEntry(vpath);
           this.connection.console.info(`Remote file removed: ${docLink.name}`);
+          this.onFileTreeChange?.("deleted", vpath);
         }
       }
     }

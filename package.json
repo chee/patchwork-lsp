@@ -1,7 +1,7 @@
 {
   "name": "patchwork-lsp",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "description": "LSP server bridging editors to automerge patchwork-filesystem",
   "license": "AGPL-3.0-or-later",
   "type": "module",

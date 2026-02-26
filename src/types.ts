@@ -27,3 +27,22 @@ export interface FileMapping {
   docHandle: DocHandle<UnixFileEntry>;
   name: string;
 }
+
+export interface ResolvedDocument {
+  virtualPath: string;
+  automergeUrl: AutomergeUrl;
+  docHandle: DocHandle<UnixFileEntry>;
+  name: string;
+}
+
+export interface DirectoryEntry {
+  name: string;
+  type: "file" | "directory";
+  virtualPath: string;
+}
+
+export interface FileStat {
+  type: "file" | "directory";
+  size: number;
+  mtime: number;
+}

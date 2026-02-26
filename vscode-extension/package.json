@@ -1,8 +1,8 @@
 {
   "name": "patchworkfs",
-  "displayName": "PatchworkFS",
+  "displayName": "patchworkfs",
   "description": "Edit automerge patchwork-filesystem folders in VS Code",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "AGPL-3.0-or-later",
   "publisher": "chee",
   "engines": {
@@ -10,11 +10,12 @@
   },
   "categories": ["Other"],
   "activationEvents": [
-    "onCommand:automerge.openFolder",
-    "onFileSystem:automerge",
-    "workspaceContains:.vscode/settings.json"
+    "*"
   ],
   "main": "./dist/extension.js",
+  "capabilities": {
+    "virtualWorkspaces": true
+  },
   "contributes": {
     "commands": [
       {
@@ -28,6 +29,16 @@
       {
         "command": "automerge.showStatus",
         "title": "PatchworkFS: Show Status"
+      }
+    ],
+    "resourceLabelFormatters": [
+      {
+        "scheme": "automerge",
+        "formatting": {
+          "label": "${path}",
+          "separator": "/",
+          "workspaceSuffix": "PatchworkFS"
+        }
       }
     ]
   },

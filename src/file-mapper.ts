@@ -2,51 +2,65 @@ import * as fs from "fs";
 import * as path from "path";
 import type { Repo, DocHandle, AutomergeUrl } from "@automerge/vanillajs";
 import type { FolderDoc, DocLink, UnixFileEntry, FileMapping } from "./types.js";
+import { DocumentResolver } from "./document-resolver.js";
 
 /**
- * FileMapper maintains the bidirectional mapping between local file paths
- * and automerge document URLs/handles.
+ * FileMapper wraps DocumentResolver and adds disk materialization.
+ * Public API is unchanged from the original — all existing call sites keep working.
  */
 export class FileMapper {
-  private mappings: Map<string, FileMapping> = new Map(); // keyed by localPath
-  private urlToPath: Map<AutomergeUrl, string> = new Map();
-  // For each file URL, the chain of parent FolderDoc handles (immediate parent first)
-  private parentFolders: Map<AutomergeUrl, DocHandle<FolderDoc>[]> = new Map();
-  private repo: Repo;
+  private resolver: DocumentResolver;
   private workspaceRoot: string;
   private folderHandle: DocHandle<FolderDoc>;
 
   constructor(repo: Repo, workspaceRoot: string, folderHandle: DocHandle<FolderDoc>) {
-    this.repo = repo;
     this.workspaceRoot = workspaceRoot;
     this.folderHandle = folderHandle;
+    this.resolver = new DocumentResolver(repo, folderHandle);
   }
 
   /**
    * Initialize mappings from the current FolderDoc state.
-   * Materializes files locally.
+   * Resolves all docs via DocumentResolver, then materializes files to disk.
    */
   async init(): Promise<void> {
-    await this.loadFolder(this.folderHandle, this.workspaceRoot, []);
+    await this.resolver.init();
+    this.materializeAll();
   }
 
   /**
-   * Recursively load a folder and its contents, tracking parent chains.
+   * Write all resolved documents to disk.
    */
-  private async loadFolder(
-    folderHandle: DocHandle<FolderDoc>,
-    basePath: string,
-    parentChain: DocHandle<FolderDoc>[]
-  ): Promise<void> {
-    const doc = folderHandle.doc();
-    if (!doc) throw new Error("FolderDoc not available");
+  private materializeAll(): void {
+    fs.mkdirSync(this.workspaceRoot, { recursive: true });
 
-    fs.mkdirSync(basePath, { recursive: true });
+    for (const resolved of this.resolver.getAllResolved()) {
+      const localPath = path.join(this.workspaceRoot, resolved.virtualPath);
+      const dir = path.dirname(localPath);
+      fs.mkdirSync(dir, { recursive: true });
 
-    const chain = [folderHandle, ...parentChain];
+      const content = this.resolver.readFileContent(resolved.virtualPath);
+      if (typeof content === "string") {
+        fs.writeFileSync(localPath, content, "utf-8");
+      }
+    }
 
-    for (const docLink of doc.docs) {
-      await this.addMapping(docLink, basePath, chain);
+    // Also ensure directories exist for folder entries
+    const rootEntries = this.resolver.listDirectory("");
+    this.materializeDirectories("", rootEntries);
+  }
+
+  /**
+   * Recursively ensure directories exist on disk.
+   */
+  private materializeDirectories(prefix: string, entries: { name: string; type: string; virtualPath: string }[]): void {
+    for (const entry of entries) {
+      if (entry.type === "directory") {
+        const localPath = path.join(this.workspaceRoot, entry.virtualPath);
+        fs.mkdirSync(localPath, { recursive: true });
+        const subEntries = this.resolver.listDirectory(entry.virtualPath);
+        this.materializeDirectories(entry.virtualPath, subEntries);
+      }
     }
   }
 
@@ -58,55 +72,39 @@ export class FileMapper {
     basePath: string = this.workspaceRoot,
     parentChain: DocHandle<FolderDoc>[] = [this.folderHandle]
   ): Promise<FileMapping | null> {
-    const localPath = path.join(basePath, docLink.name);
-
-    // Skip binary types
-    if (this.isBinaryType(docLink.type)) {
-      return null;
+    // Compute the virtual path prefix from the basePath
+    let parentPrefix = "";
+    if (basePath !== this.workspaceRoot) {
+      parentPrefix = path.relative(this.workspaceRoot, basePath);
     }
 
-    // If this DocLink is a folder, recurse into it
-    if (docLink.type === "folder" || docLink.type === "application/folder") {
-      const subFolderHandle = await this.repo.find<FolderDoc>(docLink.url);
-      await this.loadFolder(subFolderHandle, localPath, parentChain);
-      return null;
-    }
+    const resolved = await this.resolver.addEntry(docLink, parentPrefix, parentChain);
+    if (!resolved) return null;
 
-    const docHandle = await this.repo.find<UnixFileEntry>(docLink.url);
-    const doc = docHandle.doc();
-    if (!doc) return null;
-
-    // Materialize file locally
+    // Materialize to disk
+    const localPath = path.join(this.workspaceRoot, resolved.virtualPath);
     const dir = path.dirname(localPath);
     fs.mkdirSync(dir, { recursive: true });
 
-    if (typeof doc.content === "string") {
-      fs.writeFileSync(localPath, doc.content, "utf-8");
+    const content = this.resolver.readFileContent(resolved.virtualPath);
+    if (typeof content === "string") {
+      fs.writeFileSync(localPath, content, "utf-8");
     }
 
-    const mapping: FileMapping = {
+    return {
       localPath,
-      automergeUrl: docLink.url,
-      docHandle,
-      name: docLink.name,
+      automergeUrl: resolved.automergeUrl,
+      docHandle: resolved.docHandle,
+      name: resolved.name,
     };
-
-    this.mappings.set(localPath, mapping);
-    this.urlToPath.set(docLink.url, localPath);
-    this.parentFolders.set(docLink.url, parentChain);
-
-    return mapping;
   }
 
   /**
    * Remove a mapping and optionally delete the local file.
    */
   removeMapping(localPath: string, deleteFile: boolean = true): void {
-    const mapping = this.mappings.get(localPath);
-    if (!mapping) return;
-
-    this.urlToPath.delete(mapping.automergeUrl);
-    this.mappings.delete(localPath);
+    const vpath = path.relative(this.workspaceRoot, localPath);
+    this.resolver.removeEntry(vpath);
 
     if (deleteFile && fs.existsSync(localPath)) {
       fs.unlinkSync(localPath);
@@ -117,36 +115,35 @@ export class FileMapper {
    * Get mapping by local file path.
    */
   getByPath(localPath: string): FileMapping | undefined {
-    return this.mappings.get(localPath);
+    const vpath = path.relative(this.workspaceRoot, localPath);
+    const resolved = this.resolver.getByVirtualPath(vpath);
+    if (!resolved) return undefined;
+    return this.toFileMapping(resolved);
   }
 
   /**
    * Get mapping by automerge URL.
    */
   getByUrl(url: AutomergeUrl): FileMapping | undefined {
-    const localPath = this.urlToPath.get(url);
-    return localPath ? this.mappings.get(localPath) : undefined;
+    const resolved = this.resolver.getByUrl(url);
+    if (!resolved) return undefined;
+    return this.toFileMapping(resolved);
   }
 
   /**
-   * Get mapping by document URI (file:// URI from LSP).
+   * Get mapping by document URI (file:// or automerge: URI).
    */
   getByUri(uri: string): FileMapping | undefined {
-    // Convert file:// URI to local path
-    let localPath: string;
-    try {
-      localPath = new URL(uri).pathname;
-    } catch {
-      localPath = uri;
-    }
-    return this.mappings.get(localPath);
+    const resolved = this.resolver.getByUri(uri, this.workspaceRoot);
+    if (!resolved) return undefined;
+    return this.toFileMapping(resolved);
   }
 
   /**
    * Get all current mappings.
    */
   getAllMappings(): FileMapping[] {
-    return Array.from(this.mappings.values());
+    return this.resolver.getAllResolved().map((r) => this.toFileMapping(r));
   }
 
   /**
@@ -171,7 +168,7 @@ export class FileMapper {
    * Get the parent folder handles for a file, from immediate parent up to root.
    */
   getParentFolders(url: AutomergeUrl): DocHandle<FolderDoc>[] {
-    return this.parentFolders.get(url) ?? [this.folderHandle];
+    return this.resolver.getParentFolders(url);
   }
 
   /**
@@ -188,13 +185,22 @@ export class FileMapper {
     return this.workspaceRoot;
   }
 
-  private isBinaryType(type: string): boolean {
-    const binaryTypes = [
-      "image/", "audio/", "video/",
-      "application/octet-stream",
-      "application/zip",
-      "application/pdf",
-    ];
-    return binaryTypes.some((bt) => type.startsWith(bt));
+  /**
+   * Get the underlying DocumentResolver for direct access.
+   */
+  getDocumentResolver(): DocumentResolver {
+    return this.resolver;
+  }
+
+  /**
+   * Convert a ResolvedDocument to a FileMapping.
+   */
+  private toFileMapping(resolved: { virtualPath: string; automergeUrl: AutomergeUrl; docHandle: DocHandle<UnixFileEntry>; name: string }): FileMapping {
+    return {
+      localPath: path.join(this.workspaceRoot, resolved.virtualPath),
+      automergeUrl: resolved.automergeUrl,
+      docHandle: resolved.docHandle,
+      name: resolved.name,
+    };
   }
 }
