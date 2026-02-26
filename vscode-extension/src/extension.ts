@@ -10,6 +10,11 @@ import {
 
 let client: LanguageClient | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
+let currentContext: vscode.ExtensionContext | undefined;
+let currentWorkspaceRoot: string | undefined;
+let currentFolderUrl: string | undefined;
+let currentSyncServerUrl: string | undefined;
+let currentDebug: boolean | undefined;
 
 const DEFAULT_SYNC_SERVER = "wss://sync3.automerge.org";
 
@@ -23,6 +28,8 @@ interface AutomergeStatus {
 }
 
 export function activate(context: vscode.ExtensionContext) {
+  currentContext = context;
+
   // Create status bar item
   statusBarItem = vscode.window.createStatusBarItem(
     vscode.StatusBarAlignment.Left,
@@ -31,22 +38,44 @@ export function activate(context: vscode.ExtensionContext) {
   statusBarItem.command = "automerge.showStatus";
   context.subscriptions.push(statusBarItem);
 
-  // Register show status command (shows detailed info)
+  // Register show status command
   const showStatusCmd = vscode.commands.registerCommand(
     "automerge.showStatus",
     () => {
       if (!client) {
-        vscode.window.showInformationMessage("Automerge LSP is not running.");
+        vscode.window.showInformationMessage("PatchworkFS is not running.");
         return;
       }
-      // The status bar tooltip already shows details; this is a fallback
       const text = statusBarItem?.tooltip;
       if (text) {
-        vscode.window.showInformationMessage(`Automerge: ${text}`);
+        vscode.window.showInformationMessage(`PatchworkFS: ${text}`);
       }
     }
   );
   context.subscriptions.push(showStatusCmd);
+
+  // Register restart command
+  const restartCmd = vscode.commands.registerCommand(
+    "automerge.restart",
+    async () => {
+      if (currentContext && currentWorkspaceRoot && currentFolderUrl && currentSyncServerUrl) {
+        vscode.window.showInformationMessage("PatchworkFS: Restarting...");
+        await startClient(
+          currentContext,
+          currentWorkspaceRoot,
+          currentFolderUrl,
+          currentSyncServerUrl,
+          currentDebug
+        );
+        vscode.window.showInformationMessage("PatchworkFS: Restarted.");
+      } else {
+        vscode.window.showWarningMessage(
+          "PatchworkFS: No active session to restart. Use 'PatchworkFS: Open Folder' first."
+        );
+      }
+    }
+  );
+  context.subscriptions.push(restartCmd);
 
   const openFolderCmd = vscode.commands.registerCommand(
     "automerge.openFolder",
@@ -141,7 +170,7 @@ function updateStatusBar(status: AutomergeStatus): void {
       break;
   }
 
-  statusBarItem.text = `${icon} Automerge: ${label}`;
+  statusBarItem.text = `${icon} PatchworkFS: ${label}`;
 
   // Build tooltip
   const lines: string[] = [];
@@ -180,8 +209,15 @@ async function startClient(
   syncServerUrl: string,
   debug?: boolean
 ): Promise<void> {
+  // Store for restart
+  currentWorkspaceRoot = workspaceRoot;
+  currentFolderUrl = folderUrl;
+  currentSyncServerUrl = syncServerUrl;
+  currentDebug = debug;
+
   if (client) {
     await client.stop();
+    client = undefined;
   }
 
   // Show initial connecting state
@@ -219,8 +255,8 @@ async function startClient(
   };
 
   client = new LanguageClient(
-    "automerge-lsp",
-    "Automerge LSP",
+    "patchworkfs",
+    "PatchworkFS",
     serverOptions,
     clientOptions
   );

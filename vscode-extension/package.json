@@ -1,13 +1,15 @@
 {
-  "name": "automerge-lsp-vscode",
-  "displayName": "Automerge LSP",
+  "name": "patchworkfs",
+  "displayName": "PatchworkFS",
   "description": "Edit automerge patchwork-filesystem folders in VS Code",
   "version": "0.1.0",
   "private": true,
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["Other"],
+  "categories": [
+    "Other"
+  ],
   "activationEvents": [
     "onCommand:automerge.openFolder",
     "onFileSystem:automerge",
@@ -18,23 +20,31 @@
     "commands": [
       {
         "command": "automerge.openFolder",
-        "title": "Automerge: Open Folder"
+        "title": "PatchworkFS: Open Folder"
+      },
+      {
+        "command": "automerge.restart",
+        "title": "PatchworkFS: Restart"
       },
       {
         "command": "automerge.showStatus",
-        "title": "Automerge: Show Status"
+        "title": "PatchworkFS: Show Status"
       }
     ]
   },
   "scripts": {
     "build": "tsc",
-    "watch": "tsc --watch"
+    "watch": "tsc --watch",
+    "package": "vsce package",
+    "publish": "vsce publish",
+    "login": "vsce login"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
   },
   "devDependencies": {
     "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.7.1",
     "typescript": "^5.4.0"
   }
 }
