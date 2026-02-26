@@ -135,10 +135,10 @@ export class AutomergeBridge {
    * Start watching a document handle for remote changes.
    */
   watchDocument(uri: string, handle: DocHandle<UnixFileEntry>): void {
-    const onChange = ({ patches }: { doc: UnixFileEntry; patches: any[] }) => {
+    const onChange = ({ doc, patches }: { doc: UnixFileEntry; patches: any[] }) => {
       // Skip change events triggered by our own applyLocalChange calls
       if (this.localChangeInProgress) return;
-      this.handleRemotePatches(uri, patches as AutomergePatch[]);
+      this.handleRemotePatches(uri, doc, patches as AutomergePatch[]);
     };
 
     handle.on("change", onChange);
@@ -162,7 +162,7 @@ export class AutomergeBridge {
    * Handle incoming automerge patches for a document.
    * Converts them to LSP edits and pushes to the editor.
    */
-  private async handleRemotePatches(uri: string, patches: AutomergePatch[]): Promise<void> {
+  private async handleRemotePatches(uri: string, doc: UnixFileEntry, patches: AutomergePatch[]): Promise<void> {
     const debug = this.getDebug();
     const currentText = this.documentTexts.get(uri);
     if (currentText === undefined) return; // Document not open in editor
@@ -173,13 +173,71 @@ export class AutomergeBridge {
 
     if (contentPatches.length === 0) return;
 
-    // Process patches one at a time, updating our mirror text as we go
+    // If there's a "put" on "content", automerge is replacing the entire field.
+    // The subsequent splices are the new content, not incremental edits.
+    // Use the doc's actual content for a full replacement.
+    const hasPut = contentPatches.some((p) => p.action === "put" && p.path.length === 1);
+    if (hasPut) {
+      const newContent = typeof doc.content === "string" ? doc.content : "";
+      debug?.log("patch", "put detected — full replacement", {
+        oldLen: currentText.length,
+        newLen: newContent.length,
+      });
+
+      if (newContent === currentText) return; // No actual change
+
+      const lastLine = currentText.split("\n");
+      const endPos = {
+        line: lastLine.length - 1,
+        character: lastLine[lastLine.length - 1].length,
+      };
+
+      const edits: TextEdit[] = [{
+        range: { start: { line: 0, character: 0 }, end: endPos },
+        newText: newContent,
+      }];
+
+      this.documentTexts.set(uri, newContent);
+      this.statusNotifier.syncing();
+
+      debug?.editorApplyEdit(uri, 1);
+
+      this._applyingRemoteEdit = true;
+      try {
+        await this.connection.workspace.applyEdit({
+          label: "Automerge remote edit",
+          edit: { changes: { [uri]: edits } },
+        });
+      } catch (err) {
+        this.connection.console.error(`Failed to apply remote edit: ${err}`);
+      } finally {
+        this._applyingRemoteEdit = false;
+      }
+      return;
+    }
+
+    // Incremental patches — process one at a time, updating mirror as we go
     let text = currentText;
     const edits: TextEdit[] = [];
 
     for (const patch of contentPatches) {
+      debug?.log("patch", `${patch.action} path=${JSON.stringify(patch.path)}`, {
+        value: patch.value ? (patch.value.length > 80 ? patch.value.slice(0, 80) + `...(${patch.value.length} chars)` : patch.value) : undefined,
+        length: patch.length,
+        mirrorLen: text.length,
+      });
+
       const edit = patchToTextEdit(text, patch);
-      if (!edit) continue;
+      if (!edit) {
+        debug?.log("patch", "skipped (no edit produced)");
+        continue;
+      }
+
+      debug?.log("patch", "→ TextEdit", {
+        rangeStart: `${edit.range.start.line}:${edit.range.start.character}`,
+        rangeEnd: `${edit.range.end.line}:${edit.range.end.character}`,
+        newText: edit.newText.length > 80 ? edit.newText.slice(0, 80) + `...(${edit.newText.length} chars)` : edit.newText,
+      });
 
       edits.push(edit);
 

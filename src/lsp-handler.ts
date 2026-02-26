@@ -81,20 +81,10 @@ export function setupHandlers(
     if (!bridge) return;
 
     // If we're currently applying a remote edit to the editor,
-    // the didChange is just the echo — update mirror but skip automerge.
+    // the didChange is just the echo — skip it entirely.
+    // The mirror was already updated in handleRemotePatches.
     if (bridge.isApplyingRemoteEdit()) {
-      let text = bridge.getDocumentText(uri);
-      if (text === undefined) return;
-      for (const change of params.contentChanges) {
-        if (!("range" in change) || !change.range) {
-          text = change.text;
-        } else {
-          const spliceOp = lspChangeToSplice(text, change.range, change.text);
-          debug?.guardConsumed(uri, spliceOp.offset, spliceOp.deleteCount, spliceOp.insertText);
-          text = applySplice(text, spliceOp.offset, spliceOp.deleteCount, spliceOp.insertText);
-        }
-      }
-      bridge.setDocumentText(uri, text);
+      debug?.guardConsumed(uri, 0, 0, "(remote echo suppressed)");
       return;
     }
 
