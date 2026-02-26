@@ -1,0 +1,6 @@
+packages:
+  - .
+  - vscode-extension
+
+onlyBuiltDependencies:
+  - esbuild

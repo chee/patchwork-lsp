@@ -1,0 +1,31 @@
+{
+  "name": "automerge-lsp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LSP server bridging editors to automerge patchwork-filesystem",
+  "type": "module",
+  "main": "dist/server.cjs",
+  "bin": {
+    "automerge-lsp": "dist/server.cjs"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build:all": "pnpm build && pnpm --filter automerge-lsp-vscode build",
+    "launch": "pnpm build:all && code --profile automerge-dev --extensionDevelopmentPath=\"$(pwd)/vscode-extension\""
+  },
+  "dependencies": {
+    "@automerge/vanillajs": "latest",
+    "vscode-languageserver": "^9.0.1",
+    "vscode-languageserver-textdocument": "^1.0.12",
+    "vscode-languageserver-protocol": "^3.17.5"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0",
+    "@types/node": "^20.0.0"
+  }
+}
