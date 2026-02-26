@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "LSP server bridging editors to automerge patchwork-filesystem",
+  "license": "AGPL-3.0-or-later",
   "type": "module",
   "main": "dist/server.cjs",
   "bin": {
