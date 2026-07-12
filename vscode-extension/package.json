@@ -10,19 +10,15 @@
     "url": "https://github.com/chee/patchwork-lsp"
   },
   "engines": {
-    "vscode": "^1.85.0"
+    "vscode": "^1.91.0"
   },
   "categories": [
     "Other"
   ],
   "activationEvents": [
-    "onFileSystem:automerge",
-    "workspaceContains:.vscode/settings.json"
+    "onStartupFinished"
   ],
   "main": "./dist/extension.js",
-  "capabilities": {
-    "virtualWorkspaces": true
-  },
   "contributes": {
     "commands": [
       {
@@ -37,16 +33,6 @@
         "command": "automerge.showStatus",
         "title": "PatchworkFS: Show Status"
       }
-    ],
-    "resourceLabelFormatters": [
-      {
-        "scheme": "automerge",
-        "formatting": {
-          "label": "${path}",
-          "separator": "/",
-          "workspaceSuffix": "PatchworkFS"
-        }
-      }
     ]
   },
   "scripts": {
@@ -57,10 +43,11 @@
     "login": "vsce login"
   },
   "devDependencies": {
-    "@types/vscode": "^1.85.0",
-    "@vscode/vsce": "^3.7.1",
-    "esbuild": "^0.24.0",
-    "typescript": "^5.4.0",
-    "vscode-languageclient": "^9.0.1"
+    "@types/node": "^26.1.1",
+    "@types/vscode": "^1.91.0",
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.28.1",
+    "typescript": "^7.0.2",
+    "vscode-languageclient": "^10.1.0"
   }
 }

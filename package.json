@@ -18,15 +18,20 @@
     "launch": "pnpm build:all && code --profile automerge-dev --extensionDevelopmentPath=\"$(pwd)/vscode-extension\""
   },
   "dependencies": {
-    "@automerge/vanillajs": "latest",
-    "vscode-languageserver": "^9.0.1",
-    "vscode-languageserver-textdocument": "^1.0.12",
-    "vscode-languageserver-protocol": "^3.17.5"
+    "@automerge/automerge": "3.3.0-fragments.2",
+    "@automerge/automerge-repo": "2.6.0-subduction.44",
+    "@automerge/automerge-repo-network-websocket": "2.6.0-subduction.44",
+    "@automerge/automerge-subduction": "0.16.0",
+    "pushwork": "^2.2.3",
+    "vscode-languageserver": "^10.1.0",
+    "vscode-languageserver-protocol": "^3.18.2",
+    "vscode-languageserver-textdocument": "^1.0.12"
   },
   "devDependencies": {
-    "esbuild": "^0.24.0",
-    "typescript": "^5.4.0",
-    "vitest": "^1.6.0",
-    "@types/node": "^20.0.0"
+    "@types/node": "^26.1.1",
+    "esbuild": "^0.28.1",
+    "typescript": "^7.0.2",
+    "vite": "7.3.6",
+    "vitest": "^4.1.10"
   }
 }

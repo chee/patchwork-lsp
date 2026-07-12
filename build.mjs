@@ -11,7 +11,8 @@ const ctx = await esbuild.context({
   outfile: "dist/server.cjs",
   sourcemap: true,
   // Automerge has WASM that can't be bundled — keep all automerge packages external
-  external: ["@automerge/*"],
+  // pushwork depends on automerge internals and must also stay external
+  external: ["@automerge/*", "pushwork"],
 });
 
 if (watch) {

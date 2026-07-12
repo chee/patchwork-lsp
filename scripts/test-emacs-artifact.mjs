@@ -1,0 +1,20 @@
+// Edit an ARTIFACT (ImmutableString) file from Emacs; confirm it propagates.
+import { spawn } from "node:child_process";
+import * as amRepo from "@automerge/automerge-repo";
+import { RawString } from "@automerge/automerge";
+const sync = "wss://subduction.sync.inkandswitch.com", sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const EL = "/private/tmp/claude-501/-Users-chee-soft-chee-patchwork-lsp/5b5cacf1-a219-483d-b2d2-59eb2dd3fa10/scratchpad/emacs-edit-peer.el";
+await amRepo.initSubduction();
+const repo = new amRepo.Repo({ subductionWebsocketEndpoints: [sync], periodicSyncInterval: 0, batchSyncInterval: 0 });
+const file = repo.create({ "@patchwork": { type: "file" }, name: "test.txt", extension: "txt", mimeType: "text/plain", content: new RawString("hello\n") });
+const folder = repo.create({ "@patchwork": { type: "directory", title: "artifact" }, "test.txt": file.url });
+console.log("folder:", folder.url, "| content type:", file.doc().content?.constructor?.name);
+file.on("change", () => console.log("   [peerA] ->", JSON.stringify(String(file.doc().content)), "| type:", file.doc().content?.constructor?.name));
+await sleep(4000);
+const emacs = spawn("emacs", ["-Q", "--batch", "-l", EL], { env: { ...process.env, PW_FOLDER: folder.url }, cwd: process.env.HOME + "/.emacs.d" });
+let b = ""; emacs.stdout.on("data", d => { b += d; }); emacs.stderr.on("data", d => { b += d; });
+await new Promise(r => emacs.on("exit", r)); await sleep(1500);
+const final = String(file.doc().content);
+console.log("\n=== RESULT (artifact file edit) ===");
+console.log("peerA final:", JSON.stringify(final), final.startsWith("EMACS") ? "PASS ✓" : "FAIL ✗");
+process.exit(0);

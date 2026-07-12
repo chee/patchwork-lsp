@@ -1,4 +1,4 @@
-import type { AutomergeUrl, DocHandle } from "@automerge/vanillajs";
+import type { AutomergeUrl, DocHandle } from "@automerge/automerge-repo";
 
 export type FolderDoc = {
   title: string;

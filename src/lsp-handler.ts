@@ -6,10 +6,12 @@ import {
   DidOpenTextDocumentParams,
   DidCloseTextDocumentParams,
 } from "vscode-languageserver";
-import { splice as amSplice } from "@automerge/vanillajs";
+import { splice as amSplice } from "@automerge/automerge";
+import { isCollaborativeText } from "./folder-format.js";
 import type { DocumentResolver } from "./document-resolver.js";
 import type { AutomergeBridge } from "./automerge-bridge.js";
 import type { DebugLogger } from "./debug-logger.js";
+import type { ImportResolver } from "./import-resolver.js";
 import { lspChangeToSplice, applySplice } from "./edit-converter.js";
 import type { UnixFileEntry } from "./types.js";
 
@@ -17,7 +19,6 @@ export interface InitOptions {
   folderUrl: string;
   syncServerUrl: string;
   debug?: boolean;
-  mode?: "vfs" | "fallback";
 }
 
 /**
@@ -43,6 +44,30 @@ export class PendingDocuments {
 }
 
 /**
+ * Apply an edit to a file document's `content`.
+ *
+ * Collaborative files hold a splice-able string, so we splice (preserving
+ * character-level CRDT merge).  pushwork "artifact" files hold an immutable
+ * string (RawString) that cannot be spliced, so we replace the whole value
+ * with the post-edit text.
+ */
+function setContent(
+  doc: UnixFileEntry,
+  fullTextAfter: string,
+  offset: number,
+  deleteCount: number,
+  insertText: string
+): void {
+  if (isCollaborativeText(doc.content)) {
+    if (deleteCount > 0 || insertText.length > 0) {
+      amSplice(doc, ["content"], offset, deleteCount, insertText);
+    }
+  } else {
+    doc.content = fullTextAfter;
+  }
+}
+
+/**
  * Sets up all LSP handlers on the given connection.
  * Uses getter functions for resolver and bridge since they may be
  * initialized asynchronously after the server starts.
@@ -53,7 +78,9 @@ export function setupHandlers(
   getBridge: () => AutomergeBridge | undefined,
   getDebug: () => DebugLogger | undefined,
   pendingDocs: PendingDocuments,
-  getWorkspaceRoot: () => string | undefined
+  getWorkspaceRoot: () => string | undefined,
+  getRootDocId: () => string | undefined,
+  getImportResolver?: () => ImportResolver | undefined
 ): void {
   connection.onInitialized(() => {
     connection.console.info("Automerge LSP server initialized");
@@ -64,6 +91,10 @@ export function setupHandlers(
     const text = params.textDocument.text;
     const bridge = getBridge();
     const resolver = getResolver();
+
+    // Scan for automerge imports regardless of bridge status —
+    // works for regular filesystem folders too
+    getImportResolver?.()?.resolveNewImports(text);
 
     if (!bridge) {
       pendingDocs.add(uri, text);
@@ -100,32 +131,34 @@ export function setupHandlers(
 
         debug?.automergeChange(uri, 0, currentText.length, change.text);
         bridge.applyLocalChange(resolved.docHandle, (doc: UnixFileEntry) => {
-          amSplice(doc, ["content"], 0, (doc.content as string).length, change.text);
+          setContent(doc, change.text, 0, (doc.content as string).length, change.text);
         });
         continue;
       }
 
       const spliceOp = lspChangeToSplice(currentText, change.range, change.text);
-
-      debug?.lspChange(uri, spliceOp.offset, spliceOp.deleteCount, spliceOp.insertText);
-
-      debug?.automergeChange(uri, spliceOp.offset, spliceOp.deleteCount, spliceOp.insertText);
-      bridge.applyLocalChange(resolved.docHandle, (doc: UnixFileEntry) => {
-        if (spliceOp.deleteCount > 0 || spliceOp.insertText.length > 0) {
-          amSplice(doc, ["content"], spliceOp.offset, spliceOp.deleteCount, spliceOp.insertText);
-        }
-      });
-
-      currentText = applySplice(
+      const nextText = applySplice(
         currentText,
         spliceOp.offset,
         spliceOp.deleteCount,
         spliceOp.insertText
       );
+
+      debug?.lspChange(uri, spliceOp.offset, spliceOp.deleteCount, spliceOp.insertText);
+
+      debug?.automergeChange(uri, spliceOp.offset, spliceOp.deleteCount, spliceOp.insertText);
+      bridge.applyLocalChange(resolved.docHandle, (doc: UnixFileEntry) => {
+        setContent(doc, nextText, spliceOp.offset, spliceOp.deleteCount, spliceOp.insertText);
+      });
+
+      currentText = nextText;
       bridge.setDocumentText(uri, currentText);
     }
 
     bridge.touchParentFolders(resolved.automergeUrl);
+
+    // Scan updated text for new automerge imports
+    getImportResolver?.()?.resolveNewImports(currentText);
   });
 
   connection.onDidCloseTextDocument((params: DidCloseTextDocumentParams) => {
@@ -169,10 +202,23 @@ export function setupHandlers(
     if (!resolved) return { success: false };
 
     bridge.applyLocalChange(resolved.docHandle, (doc: UnixFileEntry) => {
-      amSplice(doc, ["content"], 0, (doc.content as string).length, params.content);
+      setContent(doc, params.content, 0, (doc.content as string).length, params.content);
     });
 
     return { success: true };
+  });
+
+  // --- LSP 3.18 workspace/textDocumentContent ---
+
+  connection.onRequest("workspace/textDocumentContent", (params: { uri: string }) => {
+    const resolver = getResolver();
+    if (!resolver) return { text: "" };
+
+    const vpath = resolver.uriToVirtualPath(params.uri, getWorkspaceRoot());
+    if (vpath === undefined) return { text: "" };
+
+    const content = resolver.readFileContent(vpath);
+    return { text: content ?? "" };
   });
 }
 
@@ -209,6 +255,11 @@ export function getInitializeResult(): InitializeResult {
         change: TextDocumentSyncKind.Incremental,
         save: { includeText: false },
       },
+      workspace: {
+        textDocumentContent: {
+          schemes: ["automerge"],
+        },
+      },
     },
-  };
+  } as InitializeResult;
 }

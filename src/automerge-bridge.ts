@@ -1,11 +1,17 @@
-import { Repo, WebSocketClientAdapter } from "@automerge/vanillajs";
-import type { DocHandle, AutomergeUrl } from "@automerge/vanillajs";
+import { Repo } from "@automerge/automerge-repo";
+import type { DocHandle, AutomergeUrl } from "@automerge/automerge-repo";
 import type { Connection } from "vscode-languageserver";
 import { TextEdit } from "vscode-languageserver-protocol";
 import type { DocumentResolver } from "./document-resolver.js";
 import type { StatusNotifier } from "./status-notifier.js";
 import type { DebugLogger } from "./debug-logger.js";
-import type { FolderDoc, UnixFileEntry, DocLink, ResolvedDocument } from "./types.js";
+import type { FolderDoc, UnixFileEntry, ResolvedDocument } from "./types.js";
+import {
+  type DirEntry,
+  directoryEntries,
+  normalizeAutomergeUrl,
+  contentToString,
+} from "./folder-format.js";
 import {
   patchToTextEdit,
   positionToOffset,
@@ -29,7 +35,7 @@ export type FileTreeChangeCallback = (
  * When present, the bridge delegates disk operations to it.
  */
 export interface DiskMaterializer {
-  addMapping(docLink: DocLink): Promise<{ localPath: string } | null>;
+  addMapping(entry: DirEntry): Promise<{ localPath: string } | null>;
   removeMapping(localPath: string, deleteFile: boolean): void;
   getByUrl(url: AutomergeUrl): { localPath: string } | undefined;
   pathToUri(localPath: string): string;
@@ -49,6 +55,8 @@ export class AutomergeBridge {
   private documentTexts: Map<string, string> = new Map(); // uri -> current text
   private changeListeners: Map<string, () => void> = new Map();
   private onFileTreeChange?: FileTreeChangeCallback;
+  private rootDocId?: string;
+  private workspaceRoot?: string;
 
   // Flag to suppress change events during our own docHandle.change() calls.
   private localChangeInProgress = false;
@@ -68,6 +76,8 @@ export class AutomergeBridge {
     options?: {
       diskMaterializer?: DiskMaterializer;
       onFileTreeChange?: FileTreeChangeCallback;
+      rootDocId?: string;
+      workspaceRoot?: string;
     }
   ) {
     this.repo = repo;
@@ -77,16 +87,22 @@ export class AutomergeBridge {
     this.getDebug = getDebug;
     this.diskMaterializer = options?.diskMaterializer;
     this.onFileTreeChange = options?.onFileTreeChange;
+    this.rootDocId = options?.rootDocId;
+    this.workspaceRoot = options?.workspaceRoot;
   }
 
   /**
-   * Create and connect an automerge Repo with a websocket adapter.
+   * Create and connect an automerge Repo using the subduction sync protocol.
    */
-  static createRepo(syncServerUrl: string): Repo {
-    const repo = new Repo({
-      network: [new WebSocketClientAdapter(syncServerUrl)],
-    });
-    return repo;
+  static async createRepo(syncServerUrl: string): Promise<Repo> {
+    const mod: any = await import("@automerge/automerge-repo");
+    await mod.initSubduction();
+
+    return new Repo({
+      subductionWebsocketEndpoints: [syncServerUrl],
+      periodicSyncInterval: 0,
+      batchSyncInterval: 0,
+    } as any);
   }
 
   /**
@@ -198,9 +214,13 @@ export class AutomergeBridge {
     // Send file changed notification for content changes
     this.onFileTreeChange?.("changed" as any, uri);
 
+    // Find the virtual path for textDocumentContent/refresh
+    const resolved = this.resolver.getByUri(uri, this.workspaceRoot);
+    const amUri = resolved ? this.automergeUri(resolved.virtualPath) : undefined;
+
     const hasPut = contentPatches.some((p) => p.action === "put" && p.path.length === 1);
     if (hasPut) {
-      const newContent = typeof doc.content === "string" ? doc.content : "";
+      const newContent = contentToString(doc.content) ?? "";
       debug?.log("patch", "put detected — full replacement", {
         oldLen: currentText.length,
         newLen: newContent.length,
@@ -235,6 +255,7 @@ export class AutomergeBridge {
       } finally {
         this._applyingRemoteEdit = false;
       }
+      if (amUri) this.sendContentRefresh(amUri);
       return;
     }
 
@@ -290,6 +311,7 @@ export class AutomergeBridge {
     } finally {
       this._applyingRemoteEdit = false;
     }
+    if (amUri) this.sendContentRefresh(amUri);
   }
 
   /**
@@ -297,54 +319,57 @@ export class AutomergeBridge {
    */
   watchFolder(folderHandle: DocHandle<FolderDoc>): void {
     const initialDoc = folderHandle.doc();
-    let previousDocs: DocLink[] = initialDoc ? [...initialDoc.docs] : [];
+    let previousEntries: DirEntry[] = initialDoc ? directoryEntries(initialDoc) : [];
 
     folderHandle.on("change", ({ doc }) => {
       if (this.localChangeInProgress) return;
-      const currentDocs = doc.docs;
-      this.handleFolderChanges(previousDocs, currentDocs);
-      previousDocs = [...currentDocs];
+      const currentEntries = directoryEntries(doc);
+      this.handleFolderChanges(previousEntries, currentEntries);
+      previousEntries = currentEntries;
     });
   }
 
   /**
    * Handle structural changes to the folder (file add/remove/rename).
+   * Entries are identified by their normalized (version-stripped) URL.
    */
   private async handleFolderChanges(
-    previous: DocLink[],
-    current: DocLink[]
+    previous: DirEntry[],
+    current: DirEntry[]
   ): Promise<void> {
-    const prevUrls = new Set(previous.map((d) => d.url));
-    const currUrls = new Set(current.map((d) => d.url));
+    const urlOf = (e: DirEntry) => normalizeAutomergeUrl(e.url);
+    const prevUrls = new Set(previous.map(urlOf));
+    const currUrls = new Set(current.map(urlOf));
 
     // Files added
-    for (const docLink of current) {
-      if (!prevUrls.has(docLink.url)) {
+    for (const entry of current) {
+      if (!prevUrls.has(urlOf(entry))) {
         // Add to resolver
         const rootFolderHandle = this.resolver.getRootFolderHandle();
-        const resolved = await this.resolver.addEntry(docLink, "", [rootFolderHandle]);
+        const resolved = await this.resolver.addEntry(entry, "", [rootFolderHandle]);
 
         // Also materialize to disk if we have a disk materializer
         if (this.diskMaterializer) {
-          await this.diskMaterializer.addMapping(docLink);
+          await this.diskMaterializer.addMapping(entry);
         }
 
         if (resolved) {
-          this.connection.console.info(`Remote file added: ${docLink.name}`);
+          this.connection.console.info(`Remote file added: ${entry.name}`);
           this.onFileTreeChange?.("created", resolved.virtualPath, resolved);
         }
       }
     }
 
     // Files removed
-    for (const docLink of previous) {
-      if (!currUrls.has(docLink.url)) {
-        const resolved = this.resolver.getByUrl(docLink.url);
+    for (const entry of previous) {
+      if (!currUrls.has(urlOf(entry))) {
+        const url = urlOf(entry);
+        const resolved = this.resolver.getByUrl(url);
         if (resolved) {
           // Unwatch if open in editor
           // In fallback mode, construct a file:// URI
           if (this.diskMaterializer) {
-            const diskMapping = this.diskMaterializer.getByUrl(docLink.url);
+            const diskMapping = this.diskMaterializer.getByUrl(url);
             if (diskMapping) {
               this.unwatchDocument(this.diskMaterializer.pathToUri(diskMapping.localPath));
               this.diskMaterializer.removeMapping(diskMapping.localPath, true);
@@ -353,10 +378,30 @@ export class AutomergeBridge {
 
           const vpath = resolved.virtualPath;
           this.resolver.removeEntry(vpath);
-          this.connection.console.info(`Remote file removed: ${docLink.name}`);
+          this.connection.console.info(`Remote file removed: ${entry.name}`);
           this.onFileTreeChange?.("deleted", vpath);
         }
       }
+    }
+  }
+
+  /**
+   * Construct an automerge: URI for a virtual path.
+   */
+  private automergeUri(virtualPath: string): string | undefined {
+    if (!this.rootDocId) return undefined;
+    return `automerge:/${this.rootDocId}/${virtualPath}`;
+  }
+
+  /**
+   * Send a workspace/textDocumentContent/refresh notification to the client
+   * so it re-fetches the content for the given URI.
+   */
+  private sendContentRefresh(uri: string): void {
+    try {
+      this.connection.sendNotification("workspace/textDocumentContent/refresh", { uri });
+    } catch {
+      // Client may not support this notification — ignore
     }
   }
 

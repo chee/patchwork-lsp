@@ -1,12 +1,20 @@
-import type { Repo, DocHandle, AutomergeUrl } from "@automerge/vanillajs";
+import type { Repo, DocHandle, AutomergeUrl } from "@automerge/automerge-repo";
 import type {
   FolderDoc,
-  DocLink,
   UnixFileEntry,
   ResolvedDocument,
   DirectoryEntry,
   FileStat,
 } from "./types.js";
+import {
+  type DirEntry,
+  directoryEntries,
+  isFolderish,
+  isDirectoryDoc,
+  isBinaryMime,
+  normalizeAutomergeUrl,
+  contentToString,
+} from "./folder-format.js";
 
 /**
  * DocumentResolver handles all URI-to-DocHandle resolution without any disk I/O.
@@ -37,7 +45,8 @@ export class DocumentResolver {
   }
 
   /**
-   * Recursively walk a FolderDoc, storing mappings for all entries.
+   * Recursively walk a directory document, storing mappings for all entries.
+   * Handles both the "docs array" and pushwork "flat map" folder shapes.
    */
   async loadFolder(
     folderHandle: DocHandle<FolderDoc>,
@@ -49,50 +58,58 @@ export class DocumentResolver {
 
     const chain = [folderHandle, ...parentChain];
 
-    for (const docLink of doc.docs) {
-      await this.addEntry(docLink, prefix, chain);
+    for (const entry of directoryEntries(doc)) {
+      await this.addEntry(entry, prefix, chain);
     }
   }
 
   /**
    * Add a single entry (file or subfolder) to the resolver.
+   *
+   * The file-vs-folder decision is made from the resolved child document
+   * (its `@patchwork` tag / shape) rather than trusting the parent's hint, so
+   * both folder encodings and nested directories are handled uniformly.
    */
   async addEntry(
-    docLink: DocLink,
+    entry: DirEntry,
     parentPrefix: string,
     parentChain: DocHandle<FolderDoc>[]
   ): Promise<ResolvedDocument | null> {
     const virtualPath = parentPrefix
-      ? `${parentPrefix}/${docLink.name}`
-      : docLink.name;
+      ? `${parentPrefix}/${entry.name}`
+      : entry.name;
 
-    // Skip binary types
-    if (this.isBinaryType(docLink.type)) {
-      return null;
-    }
+    // Skip binary entries early when the format tells us the mime type.
+    if (entry.type && isBinaryMime(entry.type)) return null;
 
-    // If this is a folder, recurse
-    if (docLink.type === "folder" || docLink.type === "application/folder") {
-      const subFolderHandle = await this.repo.find<FolderDoc>(docLink.url);
-      this.folderHandles.set(virtualPath, subFolderHandle);
-      await this.loadFolder(subFolderHandle, virtualPath, parentChain);
-      return null;
-    }
-
-    const docHandle = await this.repo.find<UnixFileEntry>(docLink.url);
-    const doc = docHandle.doc();
+    const url = normalizeAutomergeUrl(entry.url);
+    const handle = await this.repo.find<any>(url);
+    const doc = handle.doc();
     if (!doc) return null;
 
+    // Subfolder: recurse.
+    if (isFolderish(entry.type) || isDirectoryDoc(doc)) {
+      this.folderHandles.set(virtualPath, handle as DocHandle<FolderDoc>);
+      await this.loadFolder(handle as DocHandle<FolderDoc>, virtualPath, parentChain);
+      return null;
+    }
+
+    // File: skip binary content (only text files are materialized/editable).
+    if (isBinaryMime(doc.mimeType) || doc.content instanceof Uint8Array) {
+      return null;
+    }
+
+    const displayName = entry.name.split("/").pop() ?? entry.name;
     const resolved: ResolvedDocument = {
       virtualPath,
-      automergeUrl: docLink.url,
-      docHandle,
-      name: docLink.name,
+      automergeUrl: url,
+      docHandle: handle as DocHandle<UnixFileEntry>,
+      name: displayName,
     };
 
     this.byVirtualPath.set(virtualPath, resolved);
-    this.urlToVirtualPath.set(docLink.url, virtualPath);
-    this.parentFolders.set(docLink.url, parentChain);
+    this.urlToVirtualPath.set(url, virtualPath);
+    this.parentFolders.set(url, parentChain);
 
     return resolved;
   }
@@ -179,42 +196,55 @@ export class DocumentResolver {
     if (!resolved) return undefined;
     const doc = resolved.docHandle.doc();
     if (!doc) return undefined;
-    return typeof doc.content === "string" ? doc.content : undefined;
+    return contentToString(doc.content);
   }
 
   /**
-   * List directory entries at a given virtual path.
+   * List the immediate children at a given virtual path.
+   *
+   * Derived from the resolved file map (plus any known subfolder handles) so it
+   * works regardless of the underlying folder-doc shape — including the pushwork
+   * flat-map format where nested directories are only implied by "/" in keys.
    */
   listDirectory(vpath: string): DirectoryEntry[] {
-    const folderHandle = this.folderHandles.get(vpath);
-    if (!folderHandle) return [];
+    const prefix = vpath ? `${vpath}/` : "";
+    const names = new Map<string, "file" | "directory">();
 
-    const doc = folderHandle.doc();
-    if (!doc) return [];
-
-    const entries: DirectoryEntry[] = [];
-    for (const docLink of doc.docs) {
-      if (this.isBinaryType(docLink.type)) continue;
-
-      const entryPath = vpath ? `${vpath}/${docLink.name}` : docLink.name;
-      const isFolder =
-        docLink.type === "folder" || docLink.type === "application/folder";
-
-      entries.push({
-        name: docLink.name,
-        type: isFolder ? "directory" : "file",
-        virtualPath: entryPath,
-      });
+    for (const key of this.byVirtualPath.keys()) {
+      if (!key.startsWith(prefix)) continue;
+      const rest = key.slice(prefix.length);
+      if (!rest) continue;
+      const slash = rest.indexOf("/");
+      if (slash === -1) names.set(rest, "file");
+      else names.set(rest.slice(0, slash), "directory");
     }
-    return entries;
+
+    for (const key of this.folderHandles.keys()) {
+      if (key === "" || !key.startsWith(prefix)) continue;
+      const rest = key.slice(prefix.length);
+      if (rest && rest.indexOf("/") === -1) names.set(rest, "directory");
+    }
+
+    return Array.from(names, ([name, type]) => ({
+      name,
+      type,
+      virtualPath: `${prefix}${name}`,
+    }));
   }
 
   /**
    * Get file/directory stat information.
    */
   stat(vpath: string): FileStat | null {
-    // Check if it's a folder
-    if (this.folderHandles.has(vpath)) {
+    // Check if it's a folder — either a known folder handle, or an implied
+    // directory (some resolved file path lives beneath it).
+    const isImpliedDir =
+      this.folderHandles.has(vpath) ||
+      (vpath !== "" &&
+        Array.from(this.byVirtualPath.keys()).some((k) =>
+          k.startsWith(`${vpath}/`)
+        ));
+    if (isImpliedDir) {
       return {
         type: "directory",
         size: 0,
@@ -227,7 +257,7 @@ export class DocumentResolver {
     if (!resolved) return null;
 
     const doc = resolved.docHandle.doc();
-    const content = doc?.content;
+    const content = contentToString(doc?.content);
     const size =
       typeof content === "string"
         ? new TextEncoder().encode(content).byteLength
@@ -273,17 +303,5 @@ export class DocumentResolver {
    */
   getRepo(): Repo {
     return this.repo;
-  }
-
-  private isBinaryType(type: string): boolean {
-    const binaryTypes = [
-      "image/",
-      "audio/",
-      "video/",
-      "application/octet-stream",
-      "application/zip",
-      "application/pdf",
-    ];
-    return binaryTypes.some((bt) => type.startsWith(bt));
   }
 }

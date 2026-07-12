@@ -1,7 +1,8 @@
 import * as fs from "fs";
 import * as path from "path";
-import type { Repo, DocHandle, AutomergeUrl } from "@automerge/vanillajs";
-import type { FolderDoc, DocLink, UnixFileEntry, FileMapping } from "./types.js";
+import type { Repo, DocHandle, AutomergeUrl } from "@automerge/automerge-repo";
+import type { FolderDoc, UnixFileEntry, FileMapping } from "./types.js";
+import type { DirEntry } from "./folder-format.js";
 import { DocumentResolver } from "./document-resolver.js";
 
 /**
@@ -68,7 +69,7 @@ export class FileMapper {
    * Add a mapping for a single DocLink and materialize the file.
    */
   async addMapping(
-    docLink: DocLink,
+    entry: DirEntry,
     basePath: string = this.workspaceRoot,
     parentChain: DocHandle<FolderDoc>[] = [this.folderHandle]
   ): Promise<FileMapping | null> {
@@ -78,7 +79,7 @@ export class FileMapper {
       parentPrefix = path.relative(this.workspaceRoot, basePath);
     }
 
-    const resolved = await this.resolver.addEntry(docLink, parentPrefix, parentChain);
+    const resolved = await this.resolver.addEntry(entry, parentPrefix, parentChain);
     if (!resolved) return null;
 
     // Materialize to disk
